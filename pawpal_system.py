@@ -6,6 +6,9 @@ from typing import List, Optional, Dict, Any
 import uuid
 
 
+MAX_TASKS_PER_RUN = 200
+
+
 def _new_id() -> str:
     return str(uuid.uuid4())
 
@@ -49,6 +52,15 @@ class PetCareTask:
     scheduled_time: Optional[datetime] = None
     frequency: Optional[str] = None  # free-form (e.g., "daily", "weekly")
     completed: bool = False
+
+    def __post_init__(self) -> None:
+        self.title = self.title.strip()
+        if not self.title:
+            raise ValueError("Task title cannot be empty")
+        if self.duration_minutes <= 0:
+            raise ValueError("Task duration must be greater than 0 minutes")
+        if self.duration_minutes > 24 * 60:
+            raise ValueError("Task duration cannot exceed 1440 minutes")
 
     def is_high_priority(self) -> bool:
         """Return True when this task has high priority."""
@@ -168,27 +180,116 @@ class Owner:
 
 
 class Scheduler:
+    @staticmethod
+    def _infer_task_type(task_title: str) -> str:
+        """Infer task type from title (walk, feeding, play, grooming, vet, training)."""
+        title_lower = task_title.lower()
+        
+        if any(word in title_lower for word in ["walk", "walking"]):
+            return "walk"
+        elif any(word in title_lower for word in ["feed", "feeding", "meal", "eating"]):
+            return "feeding"
+        elif any(word in title_lower for word in ["play", "playing", "game"]):
+            return "play"
+        elif any(word in title_lower for word in ["groom", "grooming", "bath"]):
+            return "grooming"
+        elif any(word in title_lower for word in ["vet", "checkup", "visit"]):
+            return "vet"
+        elif any(word in title_lower for word in ["train", "training"]):
+            return "training"
+        else:
+            return "other"
+
+    @staticmethod
+    def _group_tasks_by_owner_and_type(
+        tasks: List[PetCareTask], pets_by_id: Dict[str, Pet]
+    ) -> Dict[tuple, List[PetCareTask]]:
+        """Group tasks by (owner_id, task_type).
+        
+        Returns a dict where keys are (owner_id, task_type) tuples and values
+        are lists of tasks with that owner and type.
+        """
+        groups: Dict[tuple, List[PetCareTask]] = {}
+        for task in tasks:
+            pet = pets_by_id.get(task.pet_id)
+            if pet:
+                owner_id = pet.owner_id
+                task_type = Scheduler._infer_task_type(task.title)
+                key = (owner_id, task_type)
+                if key not in groups:
+                    groups[key] = []
+                groups[key].append(task)
+        return groups
+
+    @staticmethod
+    def _overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+        return a_start < b_end and b_start < a_end
+
+    def _same_type(self, task_a: Optional[PetCareTask], task_b: Optional[PetCareTask]) -> bool:
+        if not task_a or not task_b:
+            return False
+        type_a = self._infer_task_type(task_a.title)
+        type_b = self._infer_task_type(task_b.title)
+        if type_a == "other" or type_b == "other":
+            return False
+        return type_a == type_b
+
+    def _next_non_conflicting_start(
+        self,
+        start: datetime,
+        duration: timedelta,
+        existing_slots: List[TimeSlot],
+        tasks_by_id: Dict[str, PetCareTask],
+        candidate_task: PetCareTask,
+        end_dt: datetime,
+    ) -> Optional[datetime]:
+        """Find earliest valid start, allowing overlaps only with same task type."""
+        probe = start
+        while probe + duration <= end_dt:
+            blocking_end: Optional[datetime] = None
+            for existing in existing_slots:
+                if not self._overlaps(probe, probe + duration, existing.start_time, existing.end_time):
+                    continue
+                existing_task = tasks_by_id.get(existing.task_id)
+                if self._same_type(existing_task, candidate_task):
+                    # Same-type tasks are allowed to run in parallel for same owner context.
+                    continue
+                if blocking_end is None or existing.end_time > blocking_end:
+                    blocking_end = existing.end_time
+
+            if blocking_end is None:
+                return probe
+            probe = blocking_end
+        return None
+
     def schedule_tasks(
         self,
         tasks: List[PetCareTask],
         preferences: Optional[List[Preference]] = None,
         constraints: Optional[List[Constraint]] = None,
+        preserve_order: bool = False,
     ) -> Schedule:
         """Produce a Schedule by placing tasks into the day.
 
         Behavior:
         - If a task has `scheduled_time`, the scheduler will place it at that time.
         - Otherwise tasks are placed greedily after the running cursor.
-        After building slots, the scheduler runs conflict detection and returns warnings.
+        - Tasks of the same type for the same owner are batched together (same time slot).
+        - Conflicts are prevented: tasks that would overlap with already-scheduled tasks are skipped.
+        - Tasks with explicit scheduled_time that conflict are also skipped.
         """
         # Simple scheduler with support for user-provided scheduled_time
         if not tasks:
             return Schedule(date=date.today(), time_slots=[])
 
+        if len(tasks) > MAX_TASKS_PER_RUN:
+            raise ValueError(f"Too many tasks ({len(tasks)}). Max supported per run: {MAX_TASKS_PER_RUN}")
+
         # Filter pending tasks
-        pending = [t for t in tasks if not t.completed]
+        pending = [t for t in tasks if not t.completed and t.duration_minutes > 0]
         # Order by priority (HIGH first) then shorter duration first
-        pending = self.optimize_by_priority(pending)
+        if not preserve_order:
+            pending = self.optimize_by_priority(pending)
 
         day = date.today()
         start_dt = datetime.combine(day, time(hour=8, minute=0))
@@ -197,33 +298,88 @@ class Scheduler:
         slots: List[TimeSlot] = []
         cursor = start_dt
 
-        for task in pending:
+        tasks_by_id: Dict[str, PetCareTask] = {t.id: t for t in tasks}
+
+        # Separate tasks: those with scheduled_time and those without
+        explicit_tasks = [t for t in pending if t.scheduled_time is not None]
+        implicit_tasks = [t for t in pending if t.scheduled_time is None]
+
+        # Process explicit scheduled_time tasks first
+        for task in explicit_tasks:
             needed = timedelta(minutes=task.duration_minutes)
-            if task.scheduled_time:
-                # honor requested scheduled_time
-                start = task.scheduled_time
-                end = start + needed
-                # drop tasks outside the scheduling window
-                if start < start_dt or end > end_dt:
-                    # skip tasks that don't fit in the window
+            start = task.scheduled_time
+            end = start + needed
+            # drop tasks outside the scheduling window
+            if start < start_dt or end > end_dt:
+                continue
+            slot = TimeSlot(start_time=start, end_time=end, task_id=task.id)
+            # Allow overlap only if all overlaps are same task type (e.g., feed multiple pets together).
+            incompatible = False
+            for existing in slots:
+                if not self._overlaps(slot.start_time, slot.end_time, existing.start_time, existing.end_time):
                     continue
-                slot = TimeSlot(start_time=start, end_time=end, task_id=task.id)
-                slots.append(slot)
-            else:
-                if cursor + needed > end_dt:
-                    # no room left in the day
+                existing_task = tasks_by_id.get(existing.task_id)
+                if not self._same_type(existing_task, task):
+                    incompatible = True
                     break
-                slot = TimeSlot(start_time=cursor, end_time=cursor + needed, task_id=task.id)
-                slots.append(slot)
-                task.scheduled_time = cursor
-                cursor = cursor + needed
+            if incompatible:
+                continue
+            slots.append(slot)
+
+        # Process implicit tasks with batching by inferred task type.
+        processed = set()
+        for task in implicit_tasks:
+            if task.id in processed:
+                continue
+
+            # Batch same-type + same-duration tasks so pets can do it at the same time.
+            task_type = self._infer_task_type(task.title)
+            same_type_tasks = [
+                t for t in implicit_tasks
+                if t.id not in processed
+                and self._infer_task_type(t.title) == task_type
+                and t.duration_minutes == task.duration_minutes
+            ]
+
+            needed = timedelta(minutes=task.duration_minutes)
+
+            chosen_start = self._next_non_conflicting_start(
+                start=cursor,
+                duration=needed,
+                existing_slots=slots,
+                tasks_by_id=tasks_by_id,
+                candidate_task=task,
+                end_dt=end_dt,
+            )
+            if chosen_start is None:
+                for t in same_type_tasks:
+                    processed.add(t.id)
+                continue
+
+            for t in same_type_tasks:
+                slots.append(
+                    TimeSlot(
+                        start_time=chosen_start,
+                        end_time=chosen_start + needed,
+                        task_id=t.id,
+                    )
+                )
+                t.scheduled_time = chosen_start
+                processed.add(t.id)
+            cursor = chosen_start + needed
 
         schedule = Schedule(date=day, time_slots=slots)
 
-        # build quick lookup of tasks by id for conflict messages
-        tasks_by_id: Dict[str, PetCareTask] = {t.id: t for t in tasks}
+        # Detect any remaining conflicts (same-type overlaps are treated as allowed).
         schedule.warnings = self.detect_conflicts(schedule.time_slots, tasks_by_id)
         return schedule
+
+    def _has_overlap(self, slot: TimeSlot, existing_slots: List[TimeSlot]) -> bool:
+        """Check if a time slot overlaps with any existing slots."""
+        for existing in existing_slots:
+            if slot.start_time < existing.end_time and existing.start_time < slot.end_time:
+                return True
+        return False
 
     def optimize_by_priority(self, tasks: List[PetCareTask]) -> List[PetCareTask]:
         """Return tasks ordered by priority and duration (high/short first)."""
@@ -294,6 +450,9 @@ class Scheduler:
                 if a.start_time < b.end_time and b.start_time < a.end_time:
                     ta = tasks_by_id.get(a.task_id)
                     tb = tasks_by_id.get(b.task_id)
+                    if self._same_type(ta, tb):
+                        # Same-type overlaps are intentional for multi-pet same-owner batching.
+                        continue
                     a_title = ta.title if ta else a.task_id
                     b_title = tb.title if tb else b.task_id
                     a_pet = ta.pet_id if ta else "?"

@@ -1,5 +1,8 @@
 import streamlit as st
+from agent_scheduler import SchedulingAgent
 from pawpal_system import Owner, Pet, PetCareTask, Scheduler, Priority
+from chatbot import parse_scheduling_intent, apply_schedule_intent, format_schedule_response
+from llm_client import LLMClient
 
 st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="centered")
 
@@ -84,10 +87,13 @@ if st.button("Add task to selected pet"):
     if selected_pet is None:
         st.error("Create or select a pet first")
     else:
-        task = PetCareTask(title=task_title, duration_minutes=int(duration), priority=Priority[priority.upper()])
-        selected_pet.add_task(task)
-        st.session_state.owner = owner
-        st.success(f"Added task '{task.title}' to {selected_pet.name}")
+        try:
+            task = PetCareTask(title=task_title, duration_minutes=int(duration), priority=Priority[priority.upper()])
+            selected_pet.add_task(task)
+            st.session_state.owner = owner
+            st.success(f"Added task '{task.title}' to {selected_pet.name}")
+        except ValueError as exc:
+            st.error(f"Could not add task: {exc}")
 
 st.markdown("### Current pets and tasks")
 if owner.get_all_pets():
@@ -120,13 +126,19 @@ if st.button("Generate schedule"):
         st.error("Add at least one pet before generating a schedule")
     else:
         sched = Scheduler()
-        schedule = sched.schedule_for_owner(owner)
+        agent = SchedulingAgent(scheduler=sched)
+        result = agent.schedule_for_owner(owner)
+        schedule = result.schedule
         st.session_state.schedule = schedule
+        st.session_state.agent_rationale = result.rationale
 
         # helper maps
         all_tasks = owner.get_all_tasks(include_completed=True)
         tasks_by_id = {t.id: t for t in all_tasks}
         pets_by_id = {p.id: p for p in owner.get_all_pets()}
+
+        with st.expander("Why this schedule was selected", expanded=False):
+            st.write(result.rationale)
 
         # display any scheduler warnings prominently
         if getattr(schedule, "warnings", None):
@@ -185,3 +197,120 @@ if st.button("Generate schedule"):
             st.table(display_rows)
         else:
             st.info("No tasks match the selected filters.")
+
+st.divider()
+
+st.subheader("💬 Chat Interface (Agentic)")
+st.caption("Ask me to schedule your pets in natural language!")
+
+# Initialize chat history
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+# Display chat history
+for message in st.session_state.chat_history:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# Chat input
+if user_input := st.chat_input("e.g., 'Schedule morning walk for Mochi and Thor'"):
+    # Add user message to history
+    st.session_state.chat_history.append({"role": "user", "content": user_input})
+
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    # Process with chatbot
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            llm_client = LLMClient()
+            
+            # Step 1: Parse intent from natural language
+            intent = parse_scheduling_intent(user_input, owner, llm_client)
+            
+            if intent.get("action") == "error":
+                response = intent.get("response", "An error occurred")
+                st.markdown(response)
+                st.session_state.chat_history.append({"role": "assistant", "content": response})
+            elif intent.get("action") == "schedule":
+                # Step 2: Apply intent (create pets/tasks if needed)
+                apply_result = apply_schedule_intent(owner, intent, llm_client)
+                
+                # IMPORTANT: Update session state so "Current pets and tasks" section shows the new pets/tasks
+                st.session_state.owner = owner
+                
+                if apply_result["added_tasks"] or apply_result["added_pets"]:
+                    confirmation = f"✅ {apply_result['message']}\n"
+                    for pet in apply_result['added_pets']:
+                        confirmation += f"- Added pet: {pet}\n"
+                    for task in apply_result['added_tasks']:
+                        confirmation += f"- Added {task['title']} for {task['pet']} ({task['duration']}m, {task['priority']})\n"
+                    
+                    # Step 3: Generate schedule using agentic workflow
+                    sched = Scheduler()
+                    agent = SchedulingAgent(scheduler=sched)
+                    result = agent.schedule_for_owner(owner)
+                    
+                    # Step 4: Format and display response
+                    schedule_response = format_schedule_response(result.schedule, owner, result.rationale)
+                    
+                    full_response = f"{confirmation}\n{schedule_response}"
+                    st.markdown(full_response)
+                    st.session_state.chat_history.append({"role": "assistant", "content": full_response})
+                    
+                    # Store for reference
+                    st.session_state.schedule = result.schedule
+                    st.session_state.agent_rationale = result.rationale
+                    
+                    # Show warnings if any
+                    if getattr(result.schedule, "warnings", None):
+                        st.warning("⚠️ Schedule optimization notes:")
+                        for w in result.schedule.warnings:
+                            st.caption(w)
+                    
+                    # Rerun so the "Current pets and tasks" and "Build Schedule" sections update with new data
+                    st.rerun()
+
+                else:
+                    msg = "I understood you want to schedule tasks, but I couldn't parse the details. Try: 'Morning walk for Mochi, 20 minutes, high priority'"
+                    st.markdown(msg)
+                    st.session_state.chat_history.append({"role": "assistant", "content": msg})
+            
+            elif intent.get("action") == "show_tasks":
+                pet_names = intent.get("pet_names", [])
+                msg = "📋 **Current tasks:**\n"
+                for p in owner.get_all_pets():
+                    if not pet_names or p.name in pet_names:
+                        tasks = p.get_tasks()
+                        if tasks:
+                            msg += f"\n**{p.name}:**\n"
+                            for t in tasks:
+                                msg += f"- {t.title} ({t.duration_minutes}m, {t.priority.name})\n"
+                        else:
+                            msg += f"\n**{p.name}:** No tasks yet\n"
+                st.markdown(msg)
+                st.session_state.chat_history.append({"role": "assistant", "content": msg})
+            
+            elif intent.get("action") == "complete_tasks":
+                pet_names = intent.get("pet_names", [])
+                completed_count = 0
+                for p in owner.get_all_pets():
+                    if not pet_names or p.name in pet_names:
+                        for t in p.get_tasks():
+                            p.complete_task(t.id)
+                            completed_count += 1
+                st.session_state.owner = owner
+                msg = f"✅ Marked {completed_count} task(s) as complete."
+                st.markdown(msg)
+                st.session_state.chat_history.append({"role": "assistant", "content": msg})
+                st.rerun()
+
+            elif intent.get("action") == "clarify":
+                msg = intent.get("clarification_needed", "I need more information. Could you be more specific?")
+                st.markdown(msg)
+                st.session_state.chat_history.append({"role": "assistant", "content": msg})
+            
+            else:
+                msg = intent.get("interpretation", "I'm not sure what you're asking. Try: 'Schedule my dogs' or 'What tasks do I have?'")
+                st.markdown(msg)
+                st.session_state.chat_history.append({"role": "assistant", "content": msg})

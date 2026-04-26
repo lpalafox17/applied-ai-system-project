@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
 
+from agent_scheduler import SchedulingAgent
+from chatbot import apply_schedule_intent
 from pawpal_system import PetCareTask, Pet, Owner, Scheduler, Priority
 
 
@@ -66,7 +68,7 @@ def test_recurring_task_generation():
 
 
 def test_conflict_detection_flags_duplicates():
-    """Scheduler should flag tasks with duplicate times as conflicts."""
+    """Scheduler should prevent conflicts by skipping conflicting tasks."""
     owner = Owner(name="ConflictOwner")
     p1 = Pet(name="A")
     p2 = Pet(name="B")
@@ -86,7 +88,131 @@ def test_conflict_detection_flags_duplicates():
     sched = Scheduler()
     schedule = sched.schedule_for_owner(owner)
 
-    assert schedule.warnings, "Expected conflict warnings but found none"
-    # ensure warning mentions both task titles
-    combined = " ".join(schedule.warnings)
-    assert "TaskA" in combined and "TaskB" in combined
+    # With conflict prevention, only one task should be scheduled (the other is skipped due to conflict)
+    assert len(schedule.time_slots) == 1, "Expected only one task to be scheduled (other skipped due to conflict)"
+    scheduled_task_id = schedule.time_slots[0].task_id
+    # One of the two tasks should be scheduled
+    assert scheduled_task_id in [t1.id, t2.id], "Expected one of the two tasks to be scheduled"
+    # No warnings should be generated since conflicts are prevented
+    assert not schedule.warnings, "Expected no conflict warnings (conflicts are prevented)"
+
+
+def test_task_guardrail_rejects_non_positive_duration():
+    try:
+        PetCareTask(title="Bad task", duration_minutes=0)
+        assert False, "Expected ValueError for non-positive duration"
+    except ValueError as exc:
+        assert "greater than 0" in str(exc)
+
+
+def test_task_guardrail_rejects_empty_title():
+    try:
+        PetCareTask(title="   ", duration_minutes=5)
+        assert False, "Expected ValueError for empty title"
+    except ValueError as exc:
+        assert "cannot be empty" in str(exc)
+
+
+class _FakeLLM:
+    def __init__(self, ordered_task_ids):
+        self._ordered = ordered_task_ids
+
+    def enabled(self):
+        return True
+
+    def propose_task_order(self, tasks, schedule):
+        return {"ordered_task_ids": self._ordered, "rationale": "Place provided order first"}
+
+
+class _BrokenLLM:
+    def enabled(self):
+        return True
+
+    def propose_task_order(self, tasks, schedule):
+        raise RuntimeError("provider unavailable")
+
+
+def test_agent_falls_back_when_llm_fails():
+    owner = Owner(name="Fallback")
+    pet = Pet(name="Milo")
+    owner.add_pet(pet)
+    pet.add_task(PetCareTask(title="Walk", duration_minutes=20, priority=Priority.HIGH))
+    pet.add_task(PetCareTask(title="Groom", duration_minutes=30, priority=Priority.LOW))
+
+    agent = SchedulingAgent(scheduler=Scheduler(), llm_client=_BrokenLLM(), max_iterations=1)
+    result = agent.schedule_for_owner(owner)
+
+    assert result.schedule.time_slots
+    assert "LLM error" in result.rationale
+
+
+def test_agent_uses_llm_reordering_when_available():
+    owner = Owner(name="Reorder")
+    pet = Pet(name="Nova")
+    owner.add_pet(pet)
+
+    t1 = PetCareTask(title="Task 1", duration_minutes=10, priority=Priority.MEDIUM)
+    t2 = PetCareTask(title="Task 2", duration_minutes=10, priority=Priority.MEDIUM)
+    t3 = PetCareTask(title="Task 3", duration_minutes=10, priority=Priority.MEDIUM)
+    pet.add_task(t1)
+    pet.add_task(t2)
+    pet.add_task(t3)
+
+    llm = _FakeLLM([t3.id, t1.id, t2.id])
+    agent = SchedulingAgent(scheduler=Scheduler(), llm_client=llm, max_iterations=1)
+    result = agent.schedule_for_owner(owner)
+
+    assert result.used_llm
+    assert result.schedule.time_slots[0].task_id == t3.id
+
+
+def test_follow_up_walk_is_scheduled_right_after_feeding_for_all_pets():
+    owner = Owner(name="Jordan")
+    mochi = Pet(name="Mochi")
+    thor = Pet(name="Thor")
+    owner.add_pet(mochi)
+    owner.add_pet(thor)
+
+    # Existing feeding block at 08:00 for both pets.
+    feeding_mochi = PetCareTask(title="feeding", duration_minutes=10, priority=Priority.HIGH)
+    feeding_thor = PetCareTask(title="feeding", duration_minutes=10, priority=Priority.HIGH)
+    today = datetime.today()
+    at_0800 = datetime.combine(today.date(), datetime.strptime("08:00", "%H:%M").time())
+    feeding_mochi.scheduled_time = at_0800
+    feeding_thor.scheduled_time = at_0800
+    mochi.add_task(feeding_mochi)
+    thor.add_task(feeding_thor)
+
+    # Follow-up request adds walks without explicit pet names.
+    walk_mochi = PetCareTask(title="walk", duration_minutes=30, priority=Priority.MEDIUM)
+    walk_thor = PetCareTask(title="walk", duration_minutes=30, priority=Priority.MEDIUM)
+    mochi.add_task(walk_mochi)
+    thor.add_task(walk_thor)
+
+    sched = Scheduler()
+    schedule = sched.schedule_for_owner(owner)
+    slots_by_task_id = {slot.task_id: slot for slot in schedule.time_slots}
+
+    assert slots_by_task_id[walk_mochi.id].start_time.strftime("%H:%M") == "08:10"
+    assert slots_by_task_id[walk_thor.id].start_time.strftime("%H:%M") == "08:10"
+    assert not schedule.warnings
+
+
+def test_apply_intent_without_pet_names_targets_all_existing_pets():
+    owner = Owner(name="Jordan")
+    mochi = Pet(name="Mochi")
+    thor = Pet(name="Thor")
+    owner.add_pet(mochi)
+    owner.add_pet(thor)
+
+    intent = {
+        "action": "schedule",
+        "pet_names": [],
+        "tasks": [{"title": "walk", "duration_minutes": 30, "priority": "MEDIUM"}],
+    }
+    result = apply_schedule_intent(owner, intent)
+
+    assert result["success"]
+    assert len(result["added_tasks"]) == 2
+    assert len(mochi.get_tasks()) == 1
+    assert len(thor.get_tasks()) == 1

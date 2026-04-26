@@ -1,0 +1,24 @@
+flowchart LR
+    H[Human User\nOwner/Pet/Task Inputs]
+    UI[Streamlit UI\napp.py]
+    V[Input Validation and Guardrails\nTask checks and bounds]
+    A[Scheduling Agent\nPlan -> Critique -> Refine]
+    S[Deterministic Scheduler\nPriority and time-slot logic]
+    LLM[LLM Provider\nReasoning and critique]
+    C[Conflict and Safety Validator\nOverlap and rule checks]
+    O[Output\nSchedule table + warnings + rationale]
+    T[Tester and Evaluator\npytest + reliability scenarios]
+    R[Test Report\nPass/fail and consistency metrics]
+
+    H --> UI --> V --> A
+    A --> S
+    A <--> LLM
+    S --> C --> O --> H
+
+    T --> UI
+    T --> A
+    T --> C
+    T --> R
+
+    C -->|invalid AI plan| S
+    H -->|review and adjust inputs| UI
