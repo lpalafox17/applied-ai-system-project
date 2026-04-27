@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/91e5f776-e423-40c2-bf2d-387445343ae3
+
 # PawPal+ AI Pet Care Scheduler
 
 ## 1. Original Project Context
