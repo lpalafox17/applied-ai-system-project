@@ -342,11 +342,3 @@ applied-ai-system-project/
 └── reflection.md                   # Original project reflection
 ```
 
-## Running for Graders
-
-1. Install and run tests: `pip install -r requirements.txt && python -m pytest`
-2. Launch the app: `streamlit run app.py`
-3. Try the sample workflow: Create owner → Add pets → Add tasks → Click "Generate schedule" → Review output
-
-
-

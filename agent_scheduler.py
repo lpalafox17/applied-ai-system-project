@@ -101,7 +101,7 @@ class SchedulingAgent:
                     best_score = candidate_score
                     working_baseline = reordered
             except Exception as exc:
-                pass  # Skip iteration on error, keep best schedule found so far
+                rationale_lines.append(f"⚠ Refinement {i}: LLM error occurred, keeping baseline schedule.")
 
         self._apply_schedule_to_owner(owner, best_schedule)
         return AgentScheduleResult(
