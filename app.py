@@ -131,11 +131,13 @@ if st.button("Generate schedule"):
         schedule = result.schedule
         st.session_state.schedule = schedule
         st.session_state.agent_rationale = result.rationale
+        st.session_state.schedule_source = "form"  # Mark that this came from the form UI
 
-        # helper maps
+        # helper maps (cached)
         all_tasks = owner.get_all_tasks(include_completed=True)
         tasks_by_id = {t.id: t for t in all_tasks}
         pets_by_id = {p.id: p for p in owner.get_all_pets()}
+        pet_names = [p.name for p in owner.get_all_pets()]
 
         with st.expander("Why this schedule was selected", expanded=False):
             st.write(result.rationale)
@@ -170,8 +172,8 @@ if st.button("Generate schedule"):
 
         # show sorted tasks (by scheduled_time) and allow filtering by pet/completed
         st.markdown("### All tasks (sorted)")
-        filter_pet = st.selectbox("Filter by pet", options=["(all)"] + [p.name for p in owner.get_all_pets()])
-        filter_completed = st.selectbox("Completion", options=["all", "pending", "completed"]) 
+        filter_pet = st.selectbox("Filter by pet", options=["(all)"] + pet_names)
+        filter_completed = st.selectbox("Completion", options=["all", "pending", "completed"])
 
         sorted_tasks = sched.sort_by_time(all_tasks)
         display_rows = []
@@ -203,6 +205,16 @@ st.divider()
 st.subheader("💬 Chat Interface (Agentic)")
 st.caption("Ask me to schedule your pets in natural language!")
 
+# Clear chat button
+col1, col2 = st.columns([4, 1])
+with col2:
+    if st.button("🗑️ Clear Chat", key="clear_chat_btn"):
+        st.session_state.chat_history = []
+        st.session_state.schedule = None
+        st.session_state.agent_rationale = None
+        st.success("Chat and schedule cleared!")
+        st.rerun()
+
 # Initialize chat history
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -223,7 +235,9 @@ if user_input := st.chat_input("e.g., 'Schedule morning walk for Mochi and Thor'
     # Process with chatbot
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            llm_client = LLMClient()
+            if "llm_client" not in st.session_state:
+                st.session_state.llm_client = LLMClient()
+            llm_client = st.session_state.llm_client
             
             # Step 1: Parse intent from natural language
             intent = parse_scheduling_intent(user_input, owner, llm_client)
@@ -250,26 +264,25 @@ if user_input := st.chat_input("e.g., 'Schedule morning walk for Mochi and Thor'
                     sched = Scheduler()
                     agent = SchedulingAgent(scheduler=sched)
                     result = agent.schedule_for_owner(owner)
-                    
+
                     # Step 4: Format and display response
                     schedule_response = format_schedule_response(result.schedule, owner, result.rationale)
-                    
+
                     full_response = f"{confirmation}\n{schedule_response}"
                     st.markdown(full_response)
                     st.session_state.chat_history.append({"role": "assistant", "content": full_response})
-                    
-                    # Store for reference
+
+                    # Store for reference and persist owner changes (task times were set by agent)
+                    st.session_state.owner = owner
                     st.session_state.schedule = result.schedule
                     st.session_state.agent_rationale = result.rationale
-                    
+                    st.session_state.schedule_source = "chat"  # Mark that this came from chat
+
                     # Show warnings if any
                     if getattr(result.schedule, "warnings", None):
                         st.warning("⚠️ Schedule optimization notes:")
                         for w in result.schedule.warnings:
                             st.caption(w)
-                    
-                    # Rerun so the "Current pets and tasks" and "Build Schedule" sections update with new data
-                    st.rerun()
 
                 else:
                     msg = "I understood you want to schedule tasks, but I couldn't parse the details. Try: 'Morning walk for Mochi, 20 minutes, high priority'"

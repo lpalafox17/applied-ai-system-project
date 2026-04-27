@@ -216,3 +216,69 @@ def test_apply_intent_without_pet_names_targets_all_existing_pets():
     assert len(result["added_tasks"]) == 2
     assert len(mochi.get_tasks()) == 1
     assert len(thor.get_tasks()) == 1
+
+
+def test_per_pet_priority_parsing():
+    """Test that chatbot correctly parses different priorities for different pets."""
+    owner = Owner(name="Jordan")
+    mochi = Pet(name="Mochi")
+    thor = Pet(name="Thor")
+    owner.add_pet(mochi)
+    owner.add_pet(thor)
+
+    # Simulate LLM returning per-pet priorities
+    intent = {
+        "action": "schedule",
+        "pet_names": ["Mochi", "Thor"],
+        "tasks": [
+            {"title": "eat", "duration_minutes": 20, "priority": "MEDIUM", "pet_name": "Mochi"},
+            {"title": "eat", "duration_minutes": 20, "priority": "LOW", "pet_name": "Thor"},
+        ],
+    }
+    result = apply_schedule_intent(owner, intent)
+
+    assert result["success"]
+    assert len(result["added_tasks"]) == 2
+
+    # Verify Mochi has MEDIUM priority eat task
+    mochi_eat = next((t for t in mochi.get_tasks() if t.title == "eat"), None)
+    assert mochi_eat is not None
+    assert mochi_eat.priority == Priority.MEDIUM
+
+    # Verify Thor has LOW priority eat task
+    thor_eat = next((t for t in thor.get_tasks() if t.title == "eat"), None)
+    assert thor_eat is not None
+    assert thor_eat.priority == Priority.LOW
+
+
+def test_no_duplicate_tasks_with_different_priorities():
+    """Test that adding the same task with different priorities for the same pet doesn't create duplicates."""
+    owner = Owner(name="Jordan")
+    mochi = Pet(name="Mochi")
+    owner.add_pet(mochi)
+
+    # Add eat task with MEDIUM priority
+    intent1 = {
+        "action": "schedule",
+        "pet_names": ["Mochi"],
+        "tasks": [{"title": "eat", "duration_minutes": 20, "priority": "MEDIUM"}],
+    }
+    result1 = apply_schedule_intent(owner, intent1)
+    assert len(result1["added_tasks"]) == 1
+
+    # Add eat task with LOW priority - should be separate task, not deduplicated
+    intent2 = {
+        "action": "schedule",
+        "pet_names": ["Mochi"],
+        "tasks": [{"title": "eat", "duration_minutes": 20, "priority": "LOW"}],
+    }
+    result2 = apply_schedule_intent(owner, intent2)
+    assert len(result2["added_tasks"]) == 1
+
+    # Mochi should have 2 eat tasks (one MEDIUM, one LOW)
+    eat_tasks = [t for t in mochi.get_tasks() if t.title == "eat"]
+    assert len(eat_tasks) == 2
+    priorities = {t.priority for t in eat_tasks}
+    assert Priority.MEDIUM in priorities
+    assert Priority.LOW in priorities
+

@@ -50,16 +50,30 @@ Extract the following as JSON (no markdown, just pure JSON):
   "action": "schedule",
   "pet_names": ["list of pet names mentioned"],
   "tasks": [
-    {{"title": "task name", "duration_minutes": 20, "priority": "HIGH"}}
+    {{"title": "task name", "duration_minutes": 20, "priority": "HIGH", "pet_name": "specific pet if mentioned, otherwise omit"}}
   ],
   "interpretation": "brief summary"
 }}
 
-Be helpful and infer reasonable defaults:
-- If duration not specified, assume 20-30 minutes
+IMPORTANT RULES:
+- If a specific pet has a specific priority mentioned (e.g., "Mochi medium, Thor low"), include pet_name in each task and use that priority
+- Do NOT create duplicate tasks for the same pet
+- If duration not specified, assume 20 minutes
 - If priority not specified, assume MEDIUM
-- If multiple pets mentioned, create tasks for each
-- Recognize common pet care tasks: walk, feeding, play, grooming, vet, training, etc.
+- Recognize common pet care tasks: walk, feeding, eat, play, grooming, vet, training, etc.
+
+EXAMPLE:
+User: "add a task for mochi to eat it is a medium priority and then Thor a low priority"
+Response:
+{{
+  "action": "schedule",
+  "pet_names": ["Mochi", "Thor"],
+  "tasks": [
+    {{"title": "eat", "duration_minutes": 20, "priority": "MEDIUM", "pet_name": "Mochi"}},
+    {{"title": "eat", "duration_minutes": 20, "priority": "LOW", "pet_name": "Thor"}}
+  ],
+  "interpretation": "Add eating task for Mochi (medium priority) and Thor (low priority)"
+}}
 
 If the user wants to mark tasks as done/complete/finished, return:
 {{
@@ -135,22 +149,30 @@ def apply_schedule_intent(
     # Add tasks to pets
     tasks_data = intent.get("tasks", [])
     if pet_names and tasks_data:
-        # If the model already attached pet names at task-level, use that mapping.
+        # Check if model provided explicit pet_name per task
         per_task_pet_mapping = any(isinstance(t, dict) and t.get("pet_name") for t in tasks_data)
         dedupe_keys = set()
 
         for task_data in tasks_data:
-            mapped_pet_names = [task_data.get("pet_name")] if per_task_pet_mapping and task_data.get("pet_name") else pet_names
+            # Use per-task pet_name if provided, otherwise apply to all pet_names
+            if per_task_pet_mapping and task_data.get("pet_name"):
+                mapped_pet_names = [task_data.get("pet_name")]
+            else:
+                mapped_pet_names = pet_names
+
             for pet_name in mapped_pet_names:
                 pet = next((p for p in owner.get_all_pets() if p.name == pet_name), None)
                 if not pet:
                     continue
 
                 try:
-                    title = str(task_data.get("title", "Unnamed task"))
+                    title = str(task_data.get("title", "Unnamed task")).strip()
                     duration = int(task_data.get("duration_minutes", 20))
                     priority_name = str(task_data.get("priority", "MEDIUM")).upper()
-                    key = (pet_name, title.strip().lower(), duration, priority_name)
+
+                    # Dedupe key: same pet, same task title, same priority
+                    # (allow different priorities for same task on same pet)
+                    key = (pet_name, title.lower(), priority_name)
                     if key in dedupe_keys:
                         continue
 
@@ -211,5 +233,6 @@ def format_schedule_response(
         
         lines.append(f"| {start}–{end} | {pet_name} | {task_title} | {duration} |")
 
-    lines.append(f"\n**✨ Reasoning:** {rationale[:250]}...")
+    lines.append(f"\n**✨ Reasoning:**")
+    lines.append(rationale)
     return "\n".join(lines)

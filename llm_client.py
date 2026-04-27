@@ -51,9 +51,10 @@ class LLMClient:
             {
                 "role": "system",
                 "content": (
-                    "You are a scheduling reviewer. Return STRICT JSON only with keys: "
-                    "ordered_task_ids (array of strings) and rationale (string). "
-                    "Prioritize safety, high-priority tasks, and fewer conflicts."
+                    "You are a pet care scheduling expert. Your job is to review the current schedule and suggest "
+                    "a better task ordering if possible. Respond ONLY with valid JSON (no markdown, no explanation outside JSON). "
+                    "Return ordered_task_ids (array of task IDs in proposed order) and rationale (a brief, human-friendly explanation "
+                    "of why this order is better, mentioning pet names and task types, not IDs)."
                 ),
             },
             {
@@ -88,9 +89,10 @@ class LLMClient:
 
     def _propose_with_anthropic(self, tasks: List[PetCareTask], schedule: Schedule) -> Dict[str, Any]:
         system_prompt = (
-            "You are a scheduling reviewer. Return STRICT JSON only with keys: "
-            "ordered_task_ids (array of strings) and rationale (string). "
-            "Prioritize safety, high-priority tasks, and fewer conflicts."
+            "You are a pet care scheduling expert. Your job is to review the current schedule and suggest "
+            "a better task ordering if possible. Respond ONLY with valid JSON (no markdown, no explanation outside JSON). "
+            "Return ordered_task_ids (array of task IDs in proposed order) and rationale (a brief, human-friendly explanation "
+            "of why this order is better, mentioning pet names and task types, not IDs)."
         )
 
         payload = {

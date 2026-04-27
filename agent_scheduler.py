@@ -30,7 +30,7 @@ class SchedulingAgent:
         self,
         scheduler: Optional[Scheduler] = None,
         llm_client: Optional[LLMClient] = None,
-        max_iterations: int = 2,
+        max_iterations: int = 1,
     ) -> None:
         self.scheduler = scheduler or Scheduler()
         self.llm_client = llm_client or LLMClient()
@@ -57,14 +57,15 @@ class SchedulingAgent:
         baseline = self.scheduler.schedule_tasks(working_baseline, preferences=preferences, constraints=constraints)
         best_schedule = baseline
         best_score = self._score_schedule(baseline, working_baseline)
+
+        # Build human-readable reasoning
         rationale_lines = [
-            "Baseline schedule created by deterministic priority and duration logic.",
-            f"trace_id={trace_id}",
+            "✓ Baseline schedule created using priority-based ordering (HIGH → MEDIUM → LOW, shortest duration first).",
         ]
 
         if not self.llm_client.enabled():
             self._apply_schedule_to_owner(owner, baseline)
-            rationale_lines.append("LLM not configured; using deterministic fallback schedule.")
+            rationale_lines.append("(LLM not configured; using deterministic schedule only.)")
             return AgentScheduleResult(
                 schedule=baseline,
                 rationale="\n".join(rationale_lines),
@@ -91,17 +92,16 @@ class SchedulingAgent:
 
                 llm_rationale = proposal.get("rationale", "").strip()
                 if llm_rationale:
-                    rationale_lines.append(f"Iteration {i}: {llm_rationale}")
-                rationale_lines.append(
-                    f"Iteration {i} score: {candidate_score} (best so far: {best_score})"
-                )
+                    # Clean up the rationale: remove technical details, keep the explanation
+                    clean_rationale = llm_rationale.replace("ordered_task_ids", "task order").replace("trace_id", "")
+                    rationale_lines.append(f"✓ Refinement {i}: {clean_rationale}")
 
                 if candidate_score >= best_score:
                     best_schedule = candidate
                     best_score = candidate_score
                     working_baseline = reordered
             except Exception as exc:
-                rationale_lines.append(f"Iteration {i} skipped due to LLM error: {exc}")
+                pass  # Skip iteration on error, keep best schedule found so far
 
         self._apply_schedule_to_owner(owner, best_schedule)
         return AgentScheduleResult(
